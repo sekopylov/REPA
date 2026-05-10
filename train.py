@@ -3,6 +3,7 @@ import copy
 from copy import deepcopy
 import logging
 import os
+import time
 from pathlib import Path
 from collections import OrderedDict
 import json
@@ -25,7 +26,10 @@ from utils import load_encoders
 from dataset import CustomDataset
 from diffusers.models import AutoencoderKL
 # import wandb_utils
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import math
 from torchvision.utils import make_grid
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -113,21 +117,40 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 
+def uses_repa(args):
+    if args.enc_type is None:
+        return False
+    return args.enc_type.lower() not in {"none", "no-repa", "baseline"} and args.proj_coeff > 0
+
+
+def tracker_name(args):
+    return args.report_to.lower()
+
+
+def should_log(args):
+    return tracker_name(args) != "none"
+
+
+def uses_wandb(args):
+    return tracker_name(args) == "wandb"
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):    
     # set accelerator
-    logging_dir = Path(args.output_dir, args.logging_dir)
+    logging_dir = Path(args.output_dir, args.exp_name, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
         )
+    log_with = None if not should_log(args) else args.report_to
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=log_with,
         project_config=accelerator_project_config,
     )
 
@@ -154,13 +177,14 @@ def main(args):
     assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.resolution // 8
 
-    if args.enc_type != None:
+    use_repa = uses_repa(args)
+    if use_repa:
         encoders, encoder_types, architectures = load_encoders(
             args.enc_type, device, args.resolution
             )
     else:
-        raise NotImplementedError()
-    z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
+        encoders, encoder_types, architectures = [], [], []
+    z_dims = [encoder.embed_dim for encoder in encoders]
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
     model = SiT_models[args.model](
         input_size=latent_size,
@@ -235,6 +259,7 @@ def main(args):
         ckpt = torch.load(
             f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
             map_location='cpu',
+            weights_only=False,
             )
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
@@ -247,13 +272,15 @@ def main(args):
 
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
-        accelerator.init_trackers(
-            project_name="REPA", 
-            config=tracker_config,
-            init_kwargs={
-                "wandb": {"name": f"{args.exp_name}"}
-            },
-        )
+        if should_log(args):
+            init_kwargs = {}
+            if uses_wandb(args):
+                init_kwargs["wandb"] = {"name": f"{args.exp_name}"}
+            accelerator.init_trackers(
+                project_name="REPA",
+                config=tracker_config,
+                init_kwargs=init_kwargs,
+            )
         
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -271,7 +298,7 @@ def main(args):
     gt_xs = sample_posterior(
         gt_xs.to(device), latents_scale=latents_scale, latents_bias=latents_bias
         )
-    ys = torch.randint(1000, size=(sample_batch_size,), device=device)
+    ys = torch.randint(args.num_classes, size=(sample_batch_size,), device=device)
     ys = ys.to(device)
     # Create sampling noise:
     n = ys.size(0)
@@ -280,6 +307,7 @@ def main(args):
     for epoch in range(args.epochs):
         model.train()
         for raw_image, x, y in train_dataloader:
+            step_start_time = time.perf_counter()
             raw_image = raw_image.to(device)
             x = x.squeeze(dim=1).to(device)
             y = y.to(device)
@@ -295,13 +323,16 @@ def main(args):
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
                 zs = []
-                with accelerator.autocast():
-                    for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
-                        raw_image_ = preprocess_raw_image(raw_image, encoder_type)
-                        z = encoder.forward_features(raw_image_)
-                        if 'mocov3' in encoder_type: z = z = z[:, 1:] 
-                        if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
-                        zs.append(z)
+                teacher_start_time = time.perf_counter()
+                if use_repa:
+                    with accelerator.autocast():
+                        for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
+                            raw_image_ = preprocess_raw_image(raw_image, encoder_type)
+                            z = encoder.forward_features(raw_image_)
+                            if 'mocov3' in encoder_type: z = z = z[:, 1:] 
+                            if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
+                            zs.append(z)
+                teacher_time = time.perf_counter() - teacher_start_time
 
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
@@ -328,7 +359,7 @@ def main(args):
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": accelerator.unwrap_model(model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
                         "args": args,
@@ -338,7 +369,7 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-            if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
+            if ((args.sample_at_step_one and global_step == 1) or (global_step % args.sampling_steps == 0 and global_step > 0)):
                 from samplers import euler_sampler
                 with torch.no_grad():
                     samples = euler_sampler(
@@ -358,17 +389,22 @@ def main(args):
                     gt_samples = (gt_samples + 1) / 2.
                 out_samples = accelerator.gather(samples.to(torch.float32))
                 gt_samples = accelerator.gather(gt_samples.to(torch.float32))
-                accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
-                                 "gt_samples": wandb.Image(array2grid(gt_samples))})
+                if uses_wandb(args) and wandb is not None:
+                    accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
+                                     "gt_samples": wandb.Image(array2grid(gt_samples))})
                 logging.info("Generating EMA samples done.")
 
+            step_time = time.perf_counter() - step_start_time
             logs = {
                 "loss": accelerator.gather(loss_mean).mean().detach().item(), 
                 "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
+                "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
+                "step_time": step_time,
+                "teacher_time": teacher_time,
             }
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            if should_log(args):
+                accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
@@ -392,6 +428,7 @@ def parse_args(input_args=None):
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
     parser.add_argument("--sampling-steps", type=int, default=10000)
+    parser.add_argument("--sample-at-step-one", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model

@@ -24,6 +24,13 @@ import argparse
 from samplers import euler_sampler, euler_maruyama_sampler
 from utils import load_legacy_checkpoints, download_model
 
+def parse_projector_embed_dims(value):
+    value = (value or "").strip()
+    if value.lower() in {"", "none", "null", "no"}:
+        return []
+    return [int(z_dim.strip()) for z_dim in value.split(',') if z_dim.strip()]
+
+
 def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     Builds a single .npz file from a folder of .png samples.
@@ -65,7 +72,7 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes,
         use_cfg = True,
-        z_dims = [int(z_dim) for z_dim in args.projector_embed_dims.split(',')],
+        z_dims = parse_projector_embed_dims(args.projector_embed_dims),
         encoder_depth=args.encoder_depth,
         **block_kwargs,
     ).to(device)
@@ -78,7 +85,9 @@ def main(args):
         assert int(args.projector_embed_dims.split(',')[0]) == 768
         state_dict = download_model('last.pt')
     else:
-        state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
+        state_dict = torch.load(
+            ckpt_path, map_location=f'cuda:{device}', weights_only=False
+            )[args.weights]
     if args.legacy:
         state_dict = load_legacy_checkpoints(
             state_dict=state_dict, encoder_depth=args.encoder_depth
@@ -179,6 +188,8 @@ if __name__ == "__main__":
 
     # logging/saving:
     parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a SiT checkpoint.")
+    parser.add_argument("--weights", choices=["ema", "model"], default="ema",
+                        help="Which train.py checkpoint weights to sample.")
     parser.add_argument("--sample-dir", type=str, default="samples")
 
     # model

@@ -78,6 +78,9 @@ class SILoss:
         denoising_loss = mean_flat((model_output - model_target) ** 2)
 
         # projection loss
+        if not zs:
+            return denoising_loss, torch.zeros_like(denoising_loss)
+
         proj_loss = 0.
         bsz = zs[0].shape[0]
         for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):

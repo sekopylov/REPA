@@ -4,6 +4,24 @@
 [![arXiv](https://img.shields.io/badge/arXiv%20paper-2410.06940-b31b1b.svg)](https://arxiv.org/abs/2410.06940)&nbsp;
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/representation-alignment-for-generation/image-generation-on-imagenet-256x256)](https://paperswithcode.com/sota/image-generation-on-imagenet-256x256?p=representation-alignment-for-generation)
 
+---
+
+> **Note:** This repository is a fork of the original REPA implementation, used as part of the **[REPA-diffusion](https://github.com/pakhomovee/REPA-diffusion)** research project.
+>
+> The parent project investigates whether REPA-style representation alignment remains beneficial under constrained data and compute — specifically on small-scale image datasets (Imagenette, Stanford Cars).
+> Key modifications in this fork relative to the original upstream code include:
+> - True baseline mode (`--enc-type none`) that skips teacher loading entirely
+> - Non-ImageNet class count support (`--num-classes`)
+> - Per-step timing logs (`step_time`, `teacher_time`)
+> - TensorBoard tracker support (`--report-to tensorboard`)
+> - CFG null-class fix for small class counts
+> - `weights_only=False` resume for PyTorch 2.6 compatibility
+>
+> For full project context, experiment scripts, and results see:
+> **[https://github.com/pakhomovee/REPA-diffusion](https://github.com/pakhomovee/REPA-diffusion)**
+
+---
+
 <div align="center">
   <a href="https://sihyun.me/" target="_blank">Sihyun&nbsp;Yu</a><sup>1</sup> &ensp; <b>&middot;</b> &ensp;
   <a href="https://www.linkedin.com/in/SangkyungKwak/" target="_blank">Sangkyung&nbsp;Kwak</a><sup>1</sup> &ensp; <b>&middot;</b> &ensp;
