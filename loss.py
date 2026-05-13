@@ -49,35 +49,66 @@ class SILoss:
             raise NotImplementedError()
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def diversity_loss(self, zs_tilde):
+    def covariance_loss(self, zs_tilde):
         """
-        Batch feature variance loss (VICReg-style variance term).
+        Off-diagonal covariance decorrelation loss (Barlow Twins / VICReg cov term).
 
-        Computes std across the BATCH dimension only (not across patches).
-        Rationale: reshaping (B, T, D) → (B*T, D) and computing std over
-        B*T=16384 samples causes std >> gamma=1.0 immediately, so the hinge
-        F.relu(gamma - std) is always 0 after step ~50 and no gradient flows.
+        For each projector head, we want the feature dimensions to be uncorrelated
+        across the batch. This prevents the projector from encoding redundant
+        information and acts as an anti-memorization regularizer.
 
-        Instead we average per-patch std over T, each computed over B samples.
-        With B=32-64, std per dim hovers around 0.3-0.8 for typical projector
-        outputs, making gamma=0.5 a sustained, reachable target.
+        Operates on L2-normalized features so it is fully compatible with proj_loss
+        (which also uses normalized features). It only penalizes the CORRELATION
+        STRUCTURE, not the direction or magnitude — so it does not fight proj_loss.
 
-        Returns a scalar tensor that stays in the computation graph.
+        For z_tilde of shape (B, T, D):
+          1. Reshape to (B, T*D) — treat each sample as a flat feature vector
+             OR average over T first to get a per-image summary (B, D).
+             We use option 2: mean-pool over T so B is the effective sample count.
+          2. L2-normalize each sample across D.
+          3. Compute the (D, D) cross-correlation matrix C = Z^T Z / B.
+          4. Loss = sum of squared off-diagonal entries of C.
+             On-diagonal entries are 1 by construction (normalized), so we skip them.
+             This is exactly the Barlow Twins off-diagonal term.
+
+        Properties:
+          - Always >= 0, equals 0 only when all feature dims are uncorrelated.
+          - Does not collapse: even a perfectly trained proj_loss still leaves
+            off-diagonal correlations to push against.
+          - Scale-invariant (works on normalized features).
+          - Compatible with fp16 (no exp/log operations).
+
+        Args:
+            zs_tilde: list of tensors, each (B, T, D)
+
+        Returns:
+            scalar tensor with gradients intact
         """
         if not zs_tilde or self.div_coeff == 0.0:
             device = zs_tilde[0].device if zs_tilde else torch.device('cpu')
             return zs_tilde[0].sum() * 0.0 if zs_tilde else torch.tensor(0.0, device=device)
 
-        gamma = 0.5   # reachable target for per-dim std over batch of 32-64
         total = None
         count = 0
+
         for z_tilde in zs_tilde:
             # z_tilde: (B, T, D)
-            # Compute std over B for each of the T patch positions, then average over T
-            # std shape: (T, D) — mean over T gives scalar per head
-            std = z_tilde.std(dim=0, unbiased=False)    # (T, D)
-            hinge = F.relu(gamma - std)                 # (T, D)
-            head_loss = hinge.mean()                    # scalar, gradients intact
+            B, T, D = z_tilde.shape
+
+            # Mean-pool over patch tokens → per-image summary (B, D)
+            z = z_tilde.mean(dim=1)              # (B, D)
+
+            # L2-normalize each sample — makes diagonal of C exactly 1
+            z = F.normalize(z, dim=-1)           # (B, D)
+
+            # Cross-correlation matrix: (D, D), values in [-1, 1]
+            C = (z.T @ z) / B                   # (D, D)
+
+            # Off-diagonal penalty: zero out diagonal, square remaining entries
+            eye = torch.eye(D, device=z.device, dtype=z.dtype)
+            off_diag = C * (1 - eye)            # (D, D), diagonal zeroed
+            head_loss = (off_diag ** 2).sum() / D   # normalize by D so scale is stable
+
             total = head_loss if total is None else total + head_loss
             count += 1
 
@@ -112,7 +143,7 @@ class SILoss:
         model_output, zs_tilde = model(model_input, time_input.flatten(), **model_kwargs)
         denoising_loss = mean_flat((model_output - model_target) ** 2)
 
-        # projection loss (REPA alignment)
+        # projection loss (REPA alignment) — normalized cosine similarity
         if not zs:
             proj_loss = torch.zeros_like(denoising_loss)
         else:
@@ -125,10 +156,11 @@ class SILoss:
                     proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
             proj_loss /= (len(zs) * bsz)
 
-        # diversity loss — scalar tensor, gradients intact (NOT detached via .item())
-        # Broadcast to a per-sample vector matching denoising_loss shape so that
-        # accelerator.gather() works correctly in the training loop.
-        div_loss_scalar = self.diversity_loss(zs_tilde)
-        div_loss = div_loss_scalar.expand(denoising_loss.shape[0])
+        # covariance decorrelation loss — off-diagonal Barlow Twins term
+        # Operates on normalized features → orthogonal to proj_loss.
+        # Does not collapse regardless of div_coeff magnitude.
+        # Broadcast to per-sample shape so accelerator.gather() works in train.py.
+        cov_loss_scalar = self.covariance_loss(zs_tilde)
+        div_loss = cov_loss_scalar.expand(denoising_loss.shape[0])
 
         return denoising_loss, proj_loss, div_loss
