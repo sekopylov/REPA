@@ -53,41 +53,35 @@ class SILoss:
         """
         Batch feature variance loss (VICReg-style variance term).
 
-        For each projector head, compute the per-dimension std of the projected
-        features across the batch and penalize low variance with:
-            loss = mean(max(0, gamma - std(z_d)))
-        where gamma is the target minimum std.
+        Computes std across the BATCH dimension only (not across patches).
+        Rationale: reshaping (B, T, D) → (B*T, D) and computing std over
+        B*T=16384 samples causes std >> gamma=1.0 immediately, so the hinge
+        F.relu(gamma - std) is always 0 after step ~50 and no gradient flows.
 
-        Features are NOT L2-normalised before computing variance — normalisation
-        would constrain all vectors to the unit hypersphere, making per-dimension
-        std geometrically bounded well below 1.0 and rendering gamma=1.0
-        unreachable.  Without normalisation, raw projector outputs typically have
-        per-dim std in the range [0.5, 2.0], so gamma=1.0 is a meaningful target.
+        Instead we average per-patch std over T, each computed over B samples.
+        With B=32-64, std per dim hovers around 0.3-0.8 for typical projector
+        outputs, making gamma=0.5 a sustained, reachable target.
 
-        Returns a scalar tensor that stays in the computation graph (gradients
-        flow back through std → projector weights).
+        Returns a scalar tensor that stays in the computation graph.
         """
         if not zs_tilde or self.div_coeff == 0.0:
-            # Return a zero tensor attached to the right device/graph
             device = zs_tilde[0].device if zs_tilde else torch.device('cpu')
-            # Use a differentiable zero so the caller can safely add it
             return zs_tilde[0].sum() * 0.0 if zs_tilde else torch.tensor(0.0, device=device)
 
-        gamma = 1.0
+        gamma = 0.5   # reachable target for per-dim std over batch of 32-64
         total = None
         count = 0
         for z_tilde in zs_tilde:
             # z_tilde: (B, T, D)
-            B, T, D = z_tilde.shape
-            z_flat = z_tilde.reshape(B * T, D)          # (B*T, D)
-            # std over the batch dimension, unbiased=False for stability
-            std = z_flat.std(dim=0, unbiased=False)     # (D,)
-            hinge = F.relu(gamma - std)                 # (D,) — penalise dims below gamma
-            head_loss = hinge.mean()                    # scalar, in computation graph
+            # Compute std over B for each of the T patch positions, then average over T
+            # std shape: (T, D) — mean over T gives scalar per head
+            std = z_tilde.std(dim=0, unbiased=False)    # (T, D)
+            hinge = F.relu(gamma - std)                 # (T, D)
+            head_loss = hinge.mean()                    # scalar, gradients intact
             total = head_loss if total is None else total + head_loss
             count += 1
 
-        return total / count  # scalar tensor, gradients intact
+        return total / count
 
     def __call__(self, model, images, model_kwargs=None, zs=None):
         if model_kwargs is None:
