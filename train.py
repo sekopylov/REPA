@@ -633,8 +633,6 @@ def parse_args(input_args=None):
     parser.add_argument("--report-to",   type=str, default="wandb")
     parser.add_argument("--sampling-steps", type=int, default=10000)
     parser.add_argument("--sample-at-step-one", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--no-sample-at-step-one", dest="sample_at_step_one",
-                        action="store_false")
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model
