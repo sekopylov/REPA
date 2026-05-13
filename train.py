@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 
 from accelerate import Accelerator
@@ -412,12 +411,8 @@ def main(args):
                 init_kwargs=init_kwargs,
             )
 
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
-        initial=global_step,
-        desc="Steps",
-        disable=not accelerator.is_local_main_process,
-    )
+    # Progress reported via plain print every --log-every steps (no tqdm)
+    _log_every = getattr(args, 'log_every', 100)
 
     # Fixed sample batch for qualitative logging
     sample_batch_size = 64 // accelerator.num_processes
@@ -533,7 +528,6 @@ def main(args):
             # FIX: EMA update uses unwrapped model (no brittle module. stripping)
             if accelerator.sync_gradients:
                 update_ema(ema, model)
-                progress_bar.update(1)
                 global_step += 1
 
             # Checkpointing
@@ -605,12 +599,17 @@ def main(args):
                 "step_time":      step_time,
                 "teacher_time":   teacher_time,
             }
-            progress_bar.set_postfix(
-                loss=f"{logs['loss/total']:.4f}",
-                diff=f"{logs['loss/denoising']:.4f}",
-                proj=f"{logs['loss/proj']:.4f}",
-                gn=f"{grad_norm_val:.3f}",
-            )
+            if accelerator.is_main_process and global_step % _log_every == 0:
+                print(
+                    f"[step {global_step:>6d}/{args.max_train_steps}]"
+                    f"  diff={logs['loss/denoising']:.4f}"
+                    f"  proj={logs['loss/proj']:.4f}"
+                    f"  div={logs['loss/div']:.4f}"
+                    f"  gn={grad_norm_val:.3f}"
+                    f"  loss={logs['loss/total']:.4f}"
+                    f"  {logs['step_time']:.2f}s/step",
+                    flush=True,
+                )
             if should_log(args):
                 accelerator.log(logs, step=global_step)
 
@@ -636,6 +635,7 @@ def parse_args(input_args=None):
     parser.add_argument("--report-to",   type=str, default="wandb")
     parser.add_argument("--sampling-steps", type=int, default=10000)
     parser.add_argument("--sample-at-step-one", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log-every", type=int, default=100, help="Print loss every N optimizer steps")
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model
