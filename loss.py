@@ -23,7 +23,7 @@ class SILoss:
         accelerator=None,
         latents_scale=None,
         latents_bias=None,
-        div_coeff=0.0,          # NEW: weight for diversity loss (0 = disabled)
+        div_coeff=0.0,
     ):
         self.prediction = prediction
         self.weighting = weighting
@@ -53,35 +53,41 @@ class SILoss:
         """
         Batch feature variance loss (VICReg-style variance term).
 
-        For each projector head, compute the per-dimension std of the
-        projected features across the batch and penalize low variance with:
+        For each projector head, compute the per-dimension std of the projected
+        features across the batch and penalize low variance with:
             loss = mean(max(0, gamma - std(z_d)))
-        where gamma=1 is the target minimum std.
+        where gamma is the target minimum std.
 
-        This encourages the model to spread its representations across the batch,
-        countering the memorization collapse where all outputs map to nearly
-        identical features.
+        Features are NOT L2-normalised before computing variance — normalisation
+        would constrain all vectors to the unit hypersphere, making per-dimension
+        std geometrically bounded well below 1.0 and rendering gamma=1.0
+        unreachable.  Without normalisation, raw projector outputs typically have
+        per-dim std in the range [0.5, 2.0], so gamma=1.0 is a meaningful target.
 
-        Returns a scalar tensor (already averaged over heads and dimensions).
+        Returns a scalar tensor that stays in the computation graph (gradients
+        flow back through std → projector weights).
         """
-        device = zs_tilde[0].device if zs_tilde else torch.device('cpu')
         if not zs_tilde or self.div_coeff == 0.0:
-            return torch.tensor(0.0, device=device)
+            # Return a zero tensor attached to the right device/graph
+            device = zs_tilde[0].device if zs_tilde else torch.device('cpu')
+            # Use a differentiable zero so the caller can safely add it
+            return zs_tilde[0].sum() * 0.0 if zs_tilde else torch.tensor(0.0, device=device)
 
         gamma = 1.0
-        total = torch.tensor(0.0, device=device)
+        total = None
         count = 0
         for z_tilde in zs_tilde:
-            # z_tilde: (B, T, D) — T patch tokens, D feature dim
+            # z_tilde: (B, T, D)
             B, T, D = z_tilde.shape
-            z_flat = z_tilde.reshape(B * T, D)                      # (B*T, D)
-            z_flat = F.normalize(z_flat, dim=-1)                     # L2-normalize before variance
-            std = z_flat.std(dim=0)                                  # (D,) per-dim std over batch
-            hinge = F.relu(gamma - std)                              # (D,) penalize dims below gamma
-            total = total + hinge.mean()
+            z_flat = z_tilde.reshape(B * T, D)          # (B*T, D)
+            # std over the batch dimension, unbiased=False for stability
+            std = z_flat.std(dim=0, unbiased=False)     # (D,)
+            hinge = F.relu(gamma - std)                 # (D,) — penalise dims below gamma
+            head_loss = hinge.mean()                    # scalar, in computation graph
+            total = head_loss if total is None else total + head_loss
             count += 1
 
-        return total / count if count > 0 else torch.tensor(0.0, device=device)
+        return total / count  # scalar tensor, gradients intact
 
     def __call__(self, model, images, model_kwargs=None, zs=None):
         if model_kwargs is None:
@@ -125,8 +131,10 @@ class SILoss:
                     proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
             proj_loss /= (len(zs) * bsz)
 
-        # NEW: diversity loss — scalar, broadcast to match denoising_loss shape for gather compatibility
-        div_loss_val = self.diversity_loss(zs_tilde)
-        div_loss = torch.full_like(denoising_loss, div_loss_val.item())
+        # diversity loss — scalar tensor, gradients intact (NOT detached via .item())
+        # Broadcast to a per-sample vector matching denoising_loss shape so that
+        # accelerator.gather() works correctly in the training loop.
+        div_loss_scalar = self.diversity_loss(zs_tilde)
+        div_loss = div_loss_scalar.expand(denoising_loss.shape[0])
 
         return denoising_loss, proj_loss, div_loss
