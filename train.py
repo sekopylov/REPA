@@ -33,6 +33,7 @@ import math
 from torchvision.utils import make_grid
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision.transforms import Normalize
+import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
 logger = get_logger(__name__)
@@ -106,18 +107,17 @@ def augment_vae(raw_image: torch.Tensor, vae, latents_scale, latents_bias,
     img_float = raw_image.float() / 255.0   # (B, C, H, W) in [0, 1]
 
     raw_aug_list = []
-    x_aug_list   = []
 
     for i in range(B):
         img_i = img_float[i]   # (C, H, W)
 
         # Random resized crop
-        top, left, height, width = TF.RandomResizedCrop.get_params(
+        top, left, height, width = T.RandomResizedCrop.get_params(
             img_i, scale=(0.8, 1.0), ratio=(3/4, 4/3)
         )
         img_i = TF.resized_crop(img_i, top, left, height, width,
                                  size=[resolution, resolution],
-                                 interpolation=TF.InterpolationMode.BICUBIC,
+                                 interpolation=T.InterpolationMode.BICUBIC,
                                  antialias=True)
 
         # Horizontal flip
@@ -132,7 +132,7 @@ def augment_vae(raw_image: torch.Tensor, vae, latents_scale, latents_bias,
     # VAE expects [-1, 1] input
     vae_input = raw_aug_float * 2.0 - 1.0
     posterior = vae.encode(vae_input).latent_dist
-    z = posterior.mean + posterior.std * torch.randn_like(posterior.mean)
+    z = posterior.sample()  # DiagonalGaussianDistribution.sample() handles reparameterisation
     x_aug = z * latents_scale + latents_bias   # apply the standard scaling
 
     # Color jitter only on the teacher's raw image (does not affect latent)
@@ -275,6 +275,9 @@ def main(args):
         project_config=accelerator_project_config,
     )
     _accelerator = accelerator  # expose for update_ema
+
+    # Logger is only created on main process; other ranks get a no-op.
+    logger = logging.getLogger(__name__)  # safe no-op fallback for non-main ranks
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
