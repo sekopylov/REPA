@@ -49,26 +49,16 @@ def augment_flip_only(raw_image: torch.Tensor, x: torch.Tensor):
     """
     Fallback augmentation: random horizontal flip applied consistently to both
     the raw uint8 image (for the teacher encoder) and the precomputed VAE latent
-    (for the diffusion model).  The VAE encoder is spatially aligned with the
-    image, so flipping the 4-channel latent on dim=-1 is equivalent to flipping
-    the corresponding image.
-
-    Args:
-        raw_image: (B, C, H, W) uint8 tensor on any device
-        x:         (B, 4, H//8, W//8) float latent tensor on any device
-
-    Returns:
-        raw_image_aug, x_aug — same shapes, consistently flipped
+    (for the diffusion model).
     """
     B = raw_image.shape[0]
-    flip_mask = torch.rand(B, device=raw_image.device) < 0.5   # (B,) bool
-    # Flip along width dimension (dim=-1) for samples where flip_mask is True
-    raw_aug = raw_image.clone()
-    x_aug   = x.clone()
-    for i in range(B):
-        if flip_mask[i]:
-            raw_aug[i] = raw_image[i].flip(-1)
-            x_aug[i]   = x[i].flip(-1)
+    flip_mask = torch.rand(B, device=raw_image.device) < 0.5 # (B,) bool
+    
+    # Vectorized flipping using torch.where to avoid slow Python loops on GPU
+    flip_mask_view = flip_mask.view(B, 1, 1, 1)
+    raw_aug = torch.where(flip_mask_view, raw_image.flip(-1), raw_image)
+    x_aug = torch.where(flip_mask_view, x.flip(-1), x)
+    
     return raw_aug, x_aug
 
 
