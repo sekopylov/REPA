@@ -289,7 +289,7 @@ def main(args):
         encoders, encoder_types, architectures = load_encoders(
             args.enc_type, device, args.resolution
         )
-        encoders = [torch.compile(enc, mode="reduce-overhead") for enc in encoders]
+        encoders = [torch.compile(enc, mode="default") for enc in encoders]
     else:
         encoders, encoder_types, architectures = [], [], []
 
@@ -309,7 +309,7 @@ def main(args):
 
     model = model.to(device)
     ema = deepcopy(model).to(device)          # deepcopy BEFORE compile — clean plain model
-    model = torch.compile(model, mode="reduce-overhead")  # compile AFTER
+    model = torch.compile(model, mode="default")  # compile AFTER
     vae   = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     requires_grad(ema, False)
     requires_grad(vae, False)   # make intent explicit; VAE is always frozen
