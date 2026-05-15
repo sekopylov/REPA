@@ -571,8 +571,7 @@ def main(args):
 
             # grad_norm: use the value from the last sync step (stale by at most
             # gradient_accumulation_steps-1 micro-steps, but always defined)
-            grad_norm_val = accelerator.gather(grad_norm).mean().detach().item() \
-                if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+            grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 
             if accelerator.is_main_process and global_step % _log_every == 0:
                 logs = {
@@ -580,8 +579,7 @@ def main(args):
                     "loss/denoising": accelerator.gather(denoising_loss_mean).mean().detach().item(),
                     "loss/proj":      accelerator.gather(proj_loss_mean).mean().detach().item(),
                     "loss/div":       accelerator.gather(div_loss_mean).mean().detach().item(),
-                    "grad_norm":      accelerator.gather(grad_norm).mean().detach().item()
-                                    if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+                    "grad_norm":      grad_norm_val,   # already local, no gather needed
                     "step_time":      step_time,
                     "teacher_time":   teacher_time,
                 }
