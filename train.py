@@ -194,18 +194,14 @@ def sample_posterior(moments, latents_scale=1., latents_bias=0.):
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     ema_params = dict(ema_model.named_parameters())
-    for name, param in accelerator_unwrap(model).named_parameters():
-        clean_name = name.replace("_orig_mod.", "")
-        ema_params[clean_name].lerp_(param.data, 1.0 - decay)
+    # Manually peel DDP and torch.compile wrappers without using accelerate
+    raw = getattr(model, 'module', model)   # strip DDP
+    raw = getattr(raw, '_orig_mod', raw)    # strip torch.compile
+    for name, param in raw.named_parameters():
+        ema_params[name].lerp_(param.data, 1.0 - decay)
 
 
-# Module-level reference set in main() so update_ema can call unwrap cleanly
 _accelerator = None
-def accelerator_unwrap(model):
-    if _accelerator is not None:
-        return _accelerator.unwrap_model(model)
-    # Fallback: strip DDP wrapper manually
-    return getattr(model, 'module', model)
 
 
 def create_logger(logging_dir):
