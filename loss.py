@@ -149,12 +149,11 @@ class SILoss:
         else:
             proj_loss = 0.
             bsz = zs[0].shape[0]
-            for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
-                for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
-                    z_tilde_j = F.normalize(z_tilde_j, dim=-1)
-                    z_j = F.normalize(z_j, dim=-1)
-                    proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-            proj_loss /= (len(zs) * bsz)
+            for z, z_tilde in zip(zs, zs_tilde):
+                z_tilde = F.normalize(z_tilde, dim=-1)
+                z       = F.normalize(z,       dim=-1)
+                proj_loss += mean_flat(-(z * z_tilde).sum(dim=-1))  # (B, T) → scalar
+            proj_loss /= len(zs)
 
         # covariance decorrelation loss — off-diagonal Barlow Twins term
         # Operates on normalized features → orthogonal to proj_loss.

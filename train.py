@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from collections import OrderedDict
 import json
+import datetime
 
 import numpy as np
 import torch
@@ -192,13 +193,9 @@ def sample_posterior(moments, latents_scale=1., latents_bias=0.):
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
-    """Step the EMA model towards the current model."""
-    ema_params   = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(
-        accelerator_unwrap(model).named_parameters()
-    )
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+    ema_params = dict(ema_model.named_parameters())
+    for name, param in accelerator_unwrap(model).named_parameters():
+        ema_params[name].lerp_(param.data, 1.0 - decay)
 
 
 # Module-level reference set in main() so update_ema can call unwrap cleanly
@@ -295,6 +292,7 @@ def main(args):
         encoders, encoder_types, architectures = load_encoders(
             args.enc_type, device, args.resolution
         )
+        encoders = [torch.compile(enc, mode="reduce-overhead") for enc in encoders]
     else:
         encoders, encoder_types, architectures = [], [], []
 
@@ -313,7 +311,8 @@ def main(args):
     )
 
     model = model.to(device)
-    ema   = deepcopy(model).to(device)
+    ema = deepcopy(model).to(device) # Deepcopy BEFORE compile
+    model = torch.compile(model, mode="reduce-overhead") # Compile AFTER
     vae   = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     requires_grad(ema, False)
     requires_grad(vae, False)   # make intent explicit; VAE is always frozen
@@ -363,6 +362,8 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=2
     )
 
     if accelerator.is_main_process:
@@ -579,41 +580,28 @@ def main(args):
             grad_norm_val = accelerator.gather(grad_norm).mean().detach().item() \
                 if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 
-            logs = {
-                # Total weighted loss (what the optimiser actually sees)
-                "loss/total":     accelerator.gather(total_loss).mean().detach().item(),
-                # Raw component losses (unweighted) for diagnosing training dynamics
-                "loss/denoising": accelerator.gather(denoising_loss_mean).mean().detach().item(),
-                "loss/proj":      accelerator.gather(proj_loss_mean).mean().detach().item(),
-                "loss/div":       accelerator.gather(div_loss_mean).mean().detach().item(),
-                # Optimisation health
-                "grad_norm":      grad_norm_val,
-                # Timing
-                "step_time":      step_time,
-                "teacher_time":   teacher_time,
-            }
             if accelerator.is_main_process and global_step % _log_every == 0:
-                import datetime
-                
-                # Calculate smooth ETA based on average step time since start
+                logs = {
+                    "loss/total":     accelerator.gather(total_loss).mean().detach().item(),
+                    "loss/denoising": accelerator.gather(denoising_loss_mean).mean().detach().item(),
+                    "loss/proj":      accelerator.gather(proj_loss_mean).mean().detach().item(),
+                    "loss/div":       accelerator.gather(div_loss_mean).mean().detach().item(),
+                    "grad_norm":      accelerator.gather(grad_norm).mean().detach().item()
+                                    if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+                    "step_time":      step_time,
+                    "teacher_time":   teacher_time,
+                }
                 avg_step_time = (time.perf_counter() - train_start_time) / max(1, global_step - initial_step)
-                eta_seconds = int((args.max_train_steps - global_step) * avg_step_time)
-                eta_str = str(datetime.timedelta(seconds=eta_seconds))
-                
+                eta_str = str(datetime.timedelta(seconds=int((args.max_train_steps - global_step) * avg_step_time)))
                 print(
                     f"[step {global_step:>6d}/{args.max_train_steps}]"
-                    f" diff={logs['loss/denoising']:.4f}"
-                    f" proj={logs['loss/proj']:.4f}"
-                    f" div={logs['loss/div']:.4f}"
-                    f" gn={grad_norm_val:.3f}"
-                    f" loss={logs['loss/total']:.4f}"
-                    f" {logs['step_time']:.2f}s/step"
-                    f" ETA: {eta_str}",
+                    f" diff={logs['loss/denoising']:.4f} proj={logs['loss/proj']:.4f}"
+                    f" div={logs['loss/div']:.4f} gn={logs['grad_norm']:.3f}"
+                    f" loss={logs['loss/total']:.4f} {step_time:.2f}s/step ETA: {eta_str}",
                     flush=True,
                 )
             if should_log(args):
                 accelerator.log(logs, step=global_step)
-
             if global_step >= args.max_train_steps:
                 break
         if global_step >= args.max_train_steps:
