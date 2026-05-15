@@ -194,9 +194,8 @@ def sample_posterior(moments, latents_scale=1., latents_bias=0.):
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     ema_params = dict(ema_model.named_parameters())
-    # Manually peel DDP and torch.compile wrappers without using accelerate
     raw = getattr(model, 'module', model)   # strip DDP
-    raw = getattr(raw, '_orig_mod', raw)    # strip torch.compile
+    raw = getattr(raw, '_orig_mod', raw)   
     for name, param in raw.named_parameters():
         ema_params[name].lerp_(param.data, 1.0 - decay)
 
@@ -289,7 +288,6 @@ def main(args):
         encoders, encoder_types, architectures = load_encoders(
             args.enc_type, device, args.resolution
         )
-        encoders = [torch.compile(enc, mode="default") for enc in encoders]
     else:
         encoders, encoder_types, architectures = [], [], []
 
@@ -308,8 +306,7 @@ def main(args):
     )
 
     model = model.to(device)
-    ema = deepcopy(model).to(device)          # deepcopy BEFORE compile — clean plain model
-    model = torch.compile(model, mode="default")  # compile AFTER
+    ema = deepcopy(model).to(device)
     vae   = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     requires_grad(ema, False)
     requires_grad(vae, False)   # make intent explicit; VAE is always frozen
