@@ -195,7 +195,8 @@ def sample_posterior(moments, latents_scale=1., latents_bias=0.):
 def update_ema(ema_model, model, decay=0.9999):
     ema_params = dict(ema_model.named_parameters())
     for name, param in accelerator_unwrap(model).named_parameters():
-        ema_params[name].lerp_(param.data, 1.0 - decay)
+        clean_name = name.replace("_orig_mod.", "")
+        ema_params[clean_name].lerp_(param.data, 1.0 - decay)
 
 
 # Module-level reference set in main() so update_ema can call unwrap cleanly
@@ -311,8 +312,8 @@ def main(args):
     )
 
     model = model.to(device)
-    ema = deepcopy(model).to(device) # Deepcopy BEFORE compile
-    model = torch.compile(model, mode="reduce-overhead") # Compile AFTER
+    ema = deepcopy(model).to(device)          # deepcopy BEFORE compile — clean plain model
+    model = torch.compile(model, mode="reduce-overhead")  # compile AFTER
     vae   = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     requires_grad(ema, False)
     requires_grad(vae, False)   # make intent explicit; VAE is always frozen
