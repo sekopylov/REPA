@@ -418,6 +418,9 @@ def main(args):
 
     # FIX: initialise grad_norm before the loop so it is always defined
     grad_norm = torch.tensor(0.0, device=device)
+    initial_step = global_step
+    train_start_time = time.perf_counter()
+
 
     for epoch in range(args.epochs):
         model.train()
@@ -590,14 +593,22 @@ def main(args):
                 "teacher_time":   teacher_time,
             }
             if accelerator.is_main_process and global_step % _log_every == 0:
+                import datetime
+                
+                # Calculate smooth ETA based on average step time since start
+                avg_step_time = (time.perf_counter() - train_start_time) / max(1, global_step - initial_step)
+                eta_seconds = int((args.max_train_steps - global_step) * avg_step_time)
+                eta_str = str(datetime.timedelta(seconds=eta_seconds))
+                
                 print(
                     f"[step {global_step:>6d}/{args.max_train_steps}]"
-                    f"  diff={logs['loss/denoising']:.4f}"
-                    f"  proj={logs['loss/proj']:.4f}"
-                    f"  div={logs['loss/div']:.4f}"
-                    f"  gn={grad_norm_val:.3f}"
-                    f"  loss={logs['loss/total']:.4f}"
-                    f"  {logs['step_time']:.2f}s/step",
+                    f" diff={logs['loss/denoising']:.4f}"
+                    f" proj={logs['loss/proj']:.4f}"
+                    f" div={logs['loss/div']:.4f}"
+                    f" gn={grad_norm_val:.3f}"
+                    f" loss={logs['loss/total']:.4f}"
+                    f" {logs['step_time']:.2f}s/step"
+                    f" ETA: {eta_str}",
                     flush=True,
                 )
             if should_log(args):
