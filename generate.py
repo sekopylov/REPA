@@ -92,7 +92,7 @@ def main(args):
         state_dict = load_legacy_checkpoints(
             state_dict=state_dict, encoder_depth=args.encoder_depth
             )
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model.eval()  # important!
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
