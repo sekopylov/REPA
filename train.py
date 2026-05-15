@@ -597,7 +597,7 @@ def main(args):
                     f" loss={logs['loss/total']:.4f} {step_time:.2f}s/step ETA: {eta_str}",
                     flush=True,
                 )
-            if should_log(args):
+            if should_log(args) and accelerator.is_main_process and global_step % _log_every == 0:
                 accelerator.log(logs, step=global_step)
             if global_step >= args.max_train_steps:
                 break
