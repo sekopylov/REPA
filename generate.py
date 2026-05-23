@@ -35,11 +35,13 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     Builds a single .npz file from a folder of .png samples.
     """
-    samples = []
-    for i in tqdm(range(num), desc="Building .npz file from samples"):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
-        samples.append(sample_np)
+    from concurrent.futures import ThreadPoolExecutor
+    paths = [f"{sample_dir}/{i:06d}.png" for i in range(num)]
+    def _load(p):
+        return np.asarray(Image.open(p)).astype(np.uint8)
+    workers = min(32, os.cpu_count() or 8)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        samples = list(tqdm(ex.map(_load, paths), total=num, desc="Building .npz file from samples"))
     samples = np.stack(samples)
     assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
@@ -156,7 +158,11 @@ def main(args):
             latents_bias = -torch.tensor(
                 [0., 0., 0., 0.,]
                 ).view(1, 4, 1, 1).to(device)
-            samples = vae.decode((samples -  latents_bias) / latents_scale).sample
+            decoded = []
+            for i in range(0, len(samples), args.vae_chunk_size):
+                chunk = samples[i:i + args.vae_chunk_size]
+                decoded.append(vae.decode((chunk - latents_bias) / latents_scale).sample)
+            samples = torch.cat(decoded, dim=0)
             samples = (samples + 1) / 2.
             samples = torch.clamp(
                 255. * samples, 0, 255
@@ -216,6 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--heun", action=argparse.BooleanOptionalAction, default=False) # only for ode
     parser.add_argument("--guidance-low", type=float, default=0.)
     parser.add_argument("--guidance-high", type=float, default=1.)
+    parser.add_argument("--vae-chunk-size", type=int, default=32, help="VAE decode mini-batch size to avoid OOM at large per-proc batch sizes")
 
     # will be deprecated
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False) # only for ode
