@@ -181,12 +181,13 @@ def main(args):
     # create loss function
     loss_fn = SILoss(
         prediction=args.prediction,
-        path_type=args.path_type, 
+        path_type=args.path_type,
         encoders=encoders,
         accelerator=accelerator,
         latents_scale=latents_scale,
         latents_bias=latents_bias,
-        weighting=args.weighting
+        weighting=args.weighting,
+        div_coeff=args.div_coeff,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -292,11 +293,12 @@ def main(args):
 
             with accelerator.accumulate(model):
                 model_kwargs = dict(context=context)
-                loss, proj_loss = loss_fn(model, x, model_kwargs, zs=zs)
-                loss_mean = loss.mean()
+                denoising_loss, proj_loss, div_loss = loss_fn(model, x, model_kwargs, zs=zs)
+                loss_mean = denoising_loss.mean()
                 proj_loss_mean = proj_loss.mean()
-                loss = loss_mean + proj_loss_mean * args.proj_coeff
-                    
+                div_loss_mean = div_loss.mean()
+                loss = loss_mean + proj_loss_mean * args.proj_coeff + div_loss_mean * args.div_coeff
+
                 ## optimization
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -353,9 +355,10 @@ def main(args):
                 logging.info("Generating EMA samples done.")
 
             logs = {
-                "loss": accelerator.gather(loss_mean).mean().detach().item(), 
+                "loss": accelerator.gather(loss_mean).mean().detach().item(),
                 "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
+                "div_loss": accelerator.gather(div_loss_mean).mean().detach().item(),
+                "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
             }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -424,6 +427,10 @@ def parse_args(input_args=None):
     parser.add_argument("--proj-coeff", type=float, default=0.5)
     parser.add_argument("--weighting", default="uniform", type=str, help="Max gradient norm.")
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--div-coeff", type=float, default=0.0,
+                        help="Coefficient for the off-diagonal covariance decorrelation loss "
+                             "(Barlow-Twins-style). Defaults to 0.0 = disabled, preserving "
+                             "behaviour identical to runs that pre-date this flag.")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
