@@ -38,6 +38,18 @@ CLI additions
         EMA decay for Bloop mode. Default 0.99.
     --sigma-log-every INT
         Write surgery_stats.csv every N steps. Default 1 (every step).
+
+    --lambda-anneal
+        Linearly anneal the REPA weight proj_coeff → --lambda-final over
+        training (between --lambda-anneal-start and --lambda-anneal-end).
+        Composes with any --sigma-mode. Motivation: REPA-Σ removes the
+        antiparallel gradient component, but the orthogonal component still
+        biases the model toward the (detail-poor) teacher manifold; annealing
+        λ → 0 removes that bias asymptotically. See
+        experiments/repa_sigma/lambda_anneal_analysis.md.
+    --lambda-anneal-start INT   step where anneal begins (default 0)
+    --lambda-anneal-end INT     step where λ hits lambda-final (default max steps)
+    --lambda-final FLOAT        final λ (default 0.0)
 """
 import argparse
 import copy
@@ -261,7 +273,7 @@ def apply_surgery_inplace(g_r, g_d, support_set, alpha):
 
 # ─── Surgery telemetry CSV writer ─────────────────────────────────────────────
 SURGERY_CSV_COLS = [
-    "global_step", "step_time", "loss_diff", "loss_repa",
+    "global_step", "step_time", "lambda_eff", "loss_diff", "loss_repa",
     "t_mean", "t_min", "t_max",
     "dot", "norm_sq_d", "norm_sq_r",
     "cos", "alpha", "projected",
@@ -278,6 +290,34 @@ def open_surgery_csv(path):
         w.writeheader()
         f.flush()
     return f, w
+
+
+def effective_lambda(args, global_step):
+    """
+    Effective REPA weight λ at this training step.
+
+    If --lambda-anneal is set, linearly interpolate proj_coeff → lambda_final
+    between lambda_anneal_start and lambda_anneal_end (default: 0 → max_train_steps).
+    Otherwise constant proj_coeff (classic REPA).
+
+    Motivation (see experiments/repa_sigma/lambda_anneal_analysis.md): REPA-Σ
+    removes the antiparallel component of g_repa, but the *orthogonal* component
+    still biases the solution toward the (invariance-trained, detail-poor)
+    teacher manifold. Annealing λ → 0 removes this bias asymptotically so the
+    denoiser can recover the fine detail the teacher cannot provide.
+    """
+    base = args.proj_coeff
+    if not getattr(args, "lambda_anneal", False):
+        return base
+    start = args.lambda_anneal_start
+    end = args.lambda_anneal_end if args.lambda_anneal_end is not None else args.max_train_steps
+    final = args.lambda_final
+    if global_step <= start:
+        return base
+    if global_step >= end:
+        return final
+    frac = (global_step - start) / max(1, (end - start))
+    return base + frac * (final - base)
 
 
 # ─── Training Loop ────────────────────────────────────────────────────────────
@@ -436,7 +476,10 @@ def main(args):
     # Open surgery telemetry CSV
     surgery_csv_path = os.path.join(args.output_dir, args.exp_name, "surgery_stats.csv")
     surgery_f, surgery_w = None, None
-    if accelerator.is_main_process and args.sigma_mode != "off":
+    # Open the per-step metrics CSV on the main process for ALL runs now (it
+    # logs lambda_eff + losses for off-mode/anneal runs, and additionally the
+    # surgery telemetry for sigma runs).
+    if accelerator.is_main_process:
         surgery_f, surgery_w = open_surgery_csv(surgery_csv_path)
 
     # Bloop-mode running EMA of g_d (kept on CPU to avoid GPU mem balloon)
@@ -481,10 +524,13 @@ def main(args):
                 # For now: log loss values only. t-distribution telemetry would
                 # require a small SILoss refactor; not done in v1.
 
+                # Effective REPA weight this step (constant, or annealed → 0).
+                lam = effective_lambda(args, global_step)
+
                 # ── Surgery decision tree ──────────────────────────────────────
                 if args.sigma_mode == "off" or not use_repa:
-                    # ===== Vanilla REPA path — byte-identical to train.py =====
-                    total = loss_mean + proj_loss_mean * args.proj_coeff
+                    # ===== Vanilla REPA path (optionally λ-annealed) =====
+                    total = loss_mean + proj_loss_mean * lam
                     accelerator.backward(total)
 
                     if accelerator.sync_gradients:
@@ -496,7 +542,11 @@ def main(args):
                     if accelerator.sync_gradients:
                         update_ema(ema, model)
 
-                    sigma_telemetry = None
+                    sigma_telemetry = dict(
+                        lambda_eff=lam, dot=float("nan"),
+                        norm_sq_d=float("nan"), norm_sq_r=float("nan"),
+                        cos=float("nan"), alpha=0.0, projected=False,
+                    )
                 else:
                     # ===== REPA-Σ path: autograd.grad + manual all-reduce ====
                     # We bypass DDP's auto-reducer because L_repa back-props
@@ -522,10 +572,10 @@ def main(args):
                     scaler = accelerator.scaler  # may be None in bf16/no-amp
                     if scaler is not None:
                         sd_loss = scaler.scale(loss_mean)
-                        sr_loss = scaler.scale(proj_loss_mean * args.proj_coeff)
+                        sr_loss = scaler.scale(proj_loss_mean * lam)
                     else:
                         sd_loss = loss_mean
-                        sr_loss = proj_loss_mean * args.proj_coeff
+                        sr_loss = proj_loss_mean * lam
 
                     # 3. Compute both gradients via autograd.grad (no DDP).
                     #    retain_graph=True on the first call; second call frees.
@@ -636,7 +686,7 @@ def main(args):
                     update_ema(ema, model)
 
                     sigma_telemetry = dict(
-                        dot=dot, norm_sq_d=norm_sq_d, norm_sq_r=norm_sq_r,
+                        lambda_eff=lam, dot=dot, norm_sq_d=norm_sq_d, norm_sq_r=norm_sq_r,
                         cos=cos_metric, alpha=alpha, projected=projected,
                     )
 
@@ -688,6 +738,7 @@ def main(args):
             }
             if sigma_telemetry is not None:
                 logs.update({
+                    "lambda_eff": sigma_telemetry["lambda_eff"],
                     "sigma_cos": sigma_telemetry["cos"],
                     "sigma_alpha": sigma_telemetry["alpha"],
                     "sigma_projected": 1.0 if sigma_telemetry["projected"] else 0.0,
@@ -697,26 +748,30 @@ def main(args):
             if should_log(args):
                 accelerator.log(logs, step=global_step)
 
-            # Surgery CSV
+            # Per-step metrics CSV (both off/anneal and surgery modes)
             if (accelerator.is_main_process and sigma_telemetry is not None
                 and surgery_w is not None
                 and (global_step % max(1, args.sigma_log_every) == 0)):
+                nsd = sigma_telemetry["norm_sq_d"]
+                nsr = sigma_telemetry["norm_sq_r"]
                 surgery_w.writerow({
                     "global_step": global_step,
                     "step_time": step_time,
+                    "lambda_eff": sigma_telemetry["lambda_eff"],
                     "loss_diff": logs["loss"],
                     "loss_repa": logs["proj_loss"],
                     "t_mean": float("nan"),  # not exposed by SILoss; placeholder
                     "t_min": float("nan"),
                     "t_max": float("nan"),
                     "dot": sigma_telemetry["dot"],
-                    "norm_sq_d": sigma_telemetry["norm_sq_d"],
-                    "norm_sq_r": sigma_telemetry["norm_sq_r"],
+                    "norm_sq_d": nsd,
+                    "norm_sq_r": nsr,
                     "cos": sigma_telemetry["cos"],
                     "alpha": sigma_telemetry["alpha"],
                     "projected": int(sigma_telemetry["projected"]),
-                    "g_d_norm": math.sqrt(sigma_telemetry["norm_sq_d"]),
-                    "g_r_norm": math.sqrt(sigma_telemetry["norm_sq_r"]),
+                    # guard against NaN (off-mode rows) — NaN != NaN
+                    "g_d_norm": math.sqrt(nsd) if (nsd == nsd and nsd >= 0) else float("nan"),
+                    "g_r_norm": math.sqrt(nsr) if (nsr == nsr and nsr >= 0) else float("nan"),
                 })
                 surgery_f.flush()
 
@@ -799,6 +854,20 @@ def parse_args(input_args=None):
                         help="EMA decay for Bloop-mode g_d direction estimate")
     parser.add_argument("--sigma-log-every", type=int, default=1,
                         help="Write a row to surgery_stats.csv every N global steps")
+
+    # ── λ-annealing flags ────────────────────────────────────────────────────
+    parser.add_argument("--lambda-anneal", action="store_true",
+                        help="Linearly anneal the REPA weight proj_coeff → lambda-final "
+                             "over training (removes the orthogonal teacher bias). "
+                             "Composes with any --sigma-mode.")
+    parser.add_argument("--lambda-anneal-start", type=int, default=0,
+                        help="Global step at which annealing begins; λ is held at "
+                             "proj_coeff before this step. Default 0 (anneal from start).")
+    parser.add_argument("--lambda-anneal-end", type=int, default=None,
+                        help="Global step at which λ reaches lambda-final. "
+                             "Default: max_train_steps.")
+    parser.add_argument("--lambda-final", type=float, default=0.0,
+                        help="Final REPA weight after annealing. Default 0.0 (REPA off at end).")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
